@@ -1,0 +1,150 @@
+name: VM Snapshot Management
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+
+jobs:
+  manage-snapshots:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install azure-cli azure-mgmt-compute azure-identity
+
+      - name: Authenticate with Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ env.AZURE_CREDENTIALS }}
+
+      - name: Get VM list from Outlook
+        run: |
+          # Implement logic to fetch VM list from Outlook and save to vmlist.txt
+          # This could be done using Microsoft Graph API or other appropriate method
+          echo "Fetching VM list from Outlook..."
+
+      - name: Generate VM Resource IDs
+        run: |
+          az account set --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          python -c "
+          import csv
+          from azure.identity import DefaultAzureCredential
+          from azure.mgmt.compute import ComputeManagementClient
+
+          credential = DefaultAzureCredential()
+          compute_client = ComputeManagementClient(credential, '${{ secrets.AZURE_SUBSCRIPTION_ID }}')
+
+          with open('vmlist.txt', 'r') as f, open('snapshot_vmlist.txt', 'w', newline='') as out:
+              writer = csv.writer(out)
+              writer.writerow(['RESOURCE_ID', 'VM_NAME', 'COMPLETION'])
+              for vm_name in f:
+                  vm_name = vm_name.strip()
+                  for vm in compute_client.virtual_machines.list_all():
+                      if vm.name.lower() == vm_name.lower():
+                          writer.writerow([vm.id, vm.name, vm_name])
+                          break
+          "
+
+      - name: Create Snapshots
+        run: |
+          python - <<EOF
+          import csv
+          import datetime
+          from azure.identity import DefaultAzureCredential
+          from azure.mgmt.compute import ComputeManagementClient
+
+          credential = DefaultAzureCredential()
+          compute_client = ComputeManagementClient(credential, '${{ secrets.AZURE_SUBSCRIPTION_ID }}')
+
+          chg_number = "AUTO-${{ github.run_id }}"
+          expire_days = 3
+
+          with open('snapshot_vmlist.txt', 'r') as f:
+              reader = csv.reader(f)
+              next(reader)  # Skip header
+              for row in reader:
+                  resource_id, vm_name, _ = row
+                  snapshot_name = f"RH_{vm_name}_{chg_number}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+                  
+                  async_snapshot_creation = compute_client.snapshots.begin_create_or_update(
+                      resource_group_name=resource_id.split('/')[4],
+                      snapshot_name=snapshot_name,
+                      snapshot={
+                          'location': 'westus',
+                          'creation_data': {
+                              'create_option': 'Copy',
+                              'source_uri': resource_id + '/osDisk'
+                          },
+                          'tags': {
+                              'ExpirationTime': (datetime.datetime.now() + datetime.timedelta(days=expire_days)).isoformat()
+                          }
+                      }
+                  )
+                  snapshot = async_snapshot_creation.result()
+                  print(f"Snapshot created: {snapshot.name}")
+          EOF
+
+      - name: Schedule Snapshot Deletion
+        run: |
+          az automation runbook create --automation-account-name ${{ secrets.AZURE_AUTOMATION_ACCOUNT }} --name DeleteExpiredSnapshots --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --type PowerShell
+
+          az automation runbook replace-content --automation-account-name ${{ secrets.AZURE_AUTOMATION_ACCOUNT }} --name DeleteExpiredSnapshots --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --content @- <<EOF
+          $ErrorActionPreference = 'Stop'
+          $connection = Get-AutomationConnection -Name AzureRunAsConnection
+          Connect-AzAccount -ServicePrincipal -Tenant $connection.TenantID -ApplicationId $connection.ApplicationID -CertificateThumbprint $connection.CertificateThumbprint
+
+          $snapshots = Get-AzSnapshot
+          foreach ($snapshot in $snapshots) {
+              if ($snapshot.Tags.ContainsKey('ExpirationTime')) {
+                  $expirationTime = [DateTime]::Parse($snapshot.Tags['ExpirationTime'])
+                  if ((Get-Date) -gt $expirationTime) {
+                      Remove-AzSnapshot -ResourceGroupName $snapshot.ResourceGroupName -SnapshotName $snapshot.Name -Force
+                      Write-Output "Deleted expired snapshot: $($snapshot.Name)"
+                  }
+              }
+          }
+          EOF
+
+          az automation schedule create --automation-account-name ${{ secrets.AZURE_AUTOMATION_ACCOUNT }} --name DeleteExpiredSnapshotsSchedule --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --start-time "$(date -u +"%Y-%m-%dT%H:%M:%SZ" -d "+1 day")" --frequency Day --interval 1
+
+          az automation job schedule create --automation-account-name ${{ secrets.AZURE_AUTOMATION_ACCOUNT }} --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --runbook-name DeleteExpiredSnapshots --schedule-name DeleteExpiredSnapshotsSchedule
+
+      - name: Update Linux VM Inventory
+        run: |
+          python - <<EOF
+          from azure.identity import DefaultAzureCredential
+          from azure.mgmt.compute import ComputeManagementClient
+          import csv
+
+          credential = DefaultAzureCredential()
+          compute_client = ComputeManagementClient(credential, '${{ secrets.AZURE_SUBSCRIPTION_ID }}')
+
+          linux_vms = [vm for vm in compute_client.virtual_machines.list_all() if vm.storage_profile.os_disk.os_type == 'Linux']
+
+          with open('linux_vm-inventory.csv', 'w', newline='') as f:
+              writer = csv.writer(f)
+              writer.writerow(['Subscription ID', 'VM Name/Hostname'])
+              for vm in linux_vms:
+                  writer.writerow(['${{ secrets.AZURE_SUBSCRIPTION_ID }}', vm.name])
+
+          print(f"Total Linux VMs: {len(linux_vms)}")
+          EOF
+
+      - name: Upload Linux VM Inventory
+        uses: actions/upload-artifact@v2
+        with:
+          name: linux-vm-inventory
+          path: linux_vm-inventory.csv
